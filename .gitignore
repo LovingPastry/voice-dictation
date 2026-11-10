@@ -1,0 +1,6 @@
+.venv
+models/
+dictation.log
+.dictate.lock
+__pycache__/
+*.part
