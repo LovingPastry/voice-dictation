@@ -19,7 +19,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import sherpa_onnx
-import sounddevice as sd
 from pynput import keyboard
 from PySide6.QtCore import QEasingCurve, QMimeData, QPropertyAnimation, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QPainter
@@ -27,6 +26,14 @@ from PySide6.QtWidgets import QApplication, QGraphicsDropShadowEffect, QHBoxLayo
 
 HERE = Path(__file__).resolve().parent
 MODEL_DIR = HERE / "models" / "sense-voice"
+
+# 没有 root 装不了 libportaudio2 时，install.sh 会把它解压到 .local/；系统有就不会走到这里
+_LOCAL_PA = HERE / ".local/usr/lib/x86_64-linux-gnu/libportaudio.so.2"
+if _LOCAL_PA.exists():
+    import ctypes.util
+    _find = ctypes.util.find_library
+    ctypes.util.find_library = lambda n: _find(n) or (str(_LOCAL_PA) if n == "portaudio" else None)
+import sounddevice as sd  # noqa: E402
 
 SAMPLE_RATE = 16000
 HOLD_THRESHOLD = 0.25    # 按住超过这么久才算听写，短按 Alt 照常给其他程序用
