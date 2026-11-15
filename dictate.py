@@ -186,8 +186,14 @@ class HotkeyListener:
         self.active = False
         self.combo = False
         self.timer = None
+        self.lock = threading.RLock()
+        self.generation = 0
 
     def on_press(self, key):
+        with self.lock:
+            self._on_press(key)
+
+    def _on_press(self, key):
         if self._is_injected(key):
             return
         if key == keyboard.Key.alt_l:
@@ -195,7 +201,9 @@ class HotkeyListener:
                 return
             self.alt_down = True
             self.combo = False
-            self.timer = threading.Timer(HOLD_THRESHOLD, self._activate)
+            self.generation += 1
+            self.timer = threading.Timer(HOLD_THRESHOLD, self._activate,
+                                         args=(self.generation,))
             self.timer.start()
         elif self.alt_down:
             self.combo = True
@@ -210,11 +218,17 @@ class HotkeyListener:
         # _break_alt_tap 注入的 F20 没有键位映射，xdotool 临时借键码发出，pynput 看到的是 vk=0
         return isinstance(key, keyboard.KeyCode) and not key.vk and not key.char
 
-    def _activate(self):
-        if self.alt_down and not self.combo:
-            self.active = True
-            self._break_alt_tap()
+    def _activate(self, generation):
+        with self.lock:
+            if generation != self.generation or not self.alt_down or self.combo:
+                return
+        self._break_alt_tap()
+        # 注入期间可能已经松键；重新校验，并把启动与停止串行化。
+        with self.lock:
+            if generation != self.generation or not self.alt_down or self.combo:
+                return
             self.d.start()
+            self.active = True
 
     def _break_alt_tap(self):
         # 很多程序（Firefox、GTK 菜单等）在"单独按下再松开 Alt"时会激活菜单栏。
@@ -222,8 +236,13 @@ class HotkeyListener:
         subprocess.run(["xdotool", "key", "F20"], timeout=1)
 
     def on_release(self, key):
+        with self.lock:
+            self._on_release(key)
+
+    def _on_release(self, key):
         if key == keyboard.Key.alt_l:
             self.alt_down = False
+            self.generation += 1
             if self.timer:
                 self.timer.cancel()
             if self.active:
