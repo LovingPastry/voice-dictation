@@ -8,6 +8,8 @@
 import fcntl
 import os
 import queue
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -34,6 +36,10 @@ SEGMENT_MIN = 12.0       # 当前段超过这么长，就在静音处切段
 SEGMENT_MAX = 25.0       # 实在找不到静音，到这么长强制切段
 NUM_THREADS = 4
 PUNCT = " .,?!。，、？！；：…"
+# 指定麦克风：PulseAudio 录音源名称里包含的字符串（pactl list sources short 查看）。
+# 不设置时自动守护第一个 USB 麦克风。
+MIC_MATCH = os.environ.get("DICTATE_MIC", "")
+MIC_CHECK_INTERVAL = 2.0  # 每隔多久检查一次麦克风连接（秒）
 
 
 def log(*args):
@@ -78,6 +84,126 @@ def find_quiet_cut(audio):
     return i * win + win // 2
 
 
+def pactl(*args):
+    """运行 pactl，成功返回标准输出，失败返回 None。固定 C locale 方便解析。"""
+    try:
+        r = subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=5,
+                           env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _blocks(text, header):
+    """按 'Card #3' 这类标题把 pactl list 的输出切块，返回 [(序号, 块文本)]。"""
+    parts = re.split(rf"^{header} #(\d+)$", text, flags=re.M)
+    return [(int(parts[i]), parts[i + 1]) for i in range(1, len(parts) - 1, 2)]
+
+
+PROFILE_RE = re.compile(r"^\t\t(\S+): .*\(sinks: \d+, sources: (\d+), "
+                        r"priority: (\d+), available: (\w+)\)$", re.M)
+
+
+def parse_cards(text):
+    cards = []
+    for _, body in _blocks(text, "Card"):
+        name = re.search(r"^\tName: (.+)$", body, re.M)
+        active = re.search(r"^\tActive Profile: (.+)$", body, re.M)
+        if not name:
+            continue
+        profiles = [dict(name=m[1], sources=int(m[2]), priority=int(m[3]), available=m[4] == "yes")
+                    for m in PROFILE_RE.finditer(body)]
+        cards.append(dict(name=name[1], active=active[1] if active else None, profiles=profiles))
+    return cards
+
+
+def input_profile_to_restore(card):
+    """声卡当前配置没有录音源时（初始化失败退成 off 等），返回应切换到的录音配置。"""
+    by_name = {p["name"]: p for p in card["profiles"]}
+    current = by_name.get(card["active"])
+    if current and current["sources"] > 0:
+        return None
+    usable = [p for p in card["profiles"] if p["sources"] > 0 and p["available"]]
+    return max(usable, key=lambda p: p["priority"])["name"] if usable else None
+
+
+def parse_sources(text):
+    """pactl list sources short -> {名称: 序号}"""
+    out = {}
+    for line in text.splitlines():
+        cols = line.split("\t")
+        if len(cols) >= 2 and cols[0].isdigit():
+            out[cols[1]] = int(cols[0])
+    return out
+
+
+def parse_source_outputs(text):
+    outs = []
+    for index, body in _blocks(text, "Source Output"):
+        src = re.search(r"^\tSource: (\d+)$", body, re.M)
+        pid = re.search(r'^\t\tapplication\.process\.id = "(\d+)"$', body, re.M)
+        if src:
+            outs.append(dict(index=index, source=int(src[1]), pid=int(pid[1]) if pid else None))
+    return outs
+
+
+class MicKeeper:
+    """守护麦克风连接。
+
+    显示器自带的摄像头麦克风会随显示器断电消失。PulseAudio 会把录音流挪到别的源
+    （常常是扬声器回环 *.monitor），麦克风回来后也不一定挪回去；设备刚上电时
+    PulseAudio 还可能初始化失败，把声卡留在没有录音源的配置上。这里定期检查：
+    把声卡切回录音配置，把本进程的录音流挪回目标麦克风，麦克风不在时标记 ok=False。
+    """
+
+    def __init__(self, match="", pid=None, run=pactl, log=print):
+        self.explicit = bool(match)
+        self.match = match or "usb-"
+        self.pid = pid if pid is not None else os.getpid()
+        self.run = run
+        self.log = log
+        self.armed = self.explicit  # 自动模式下，见过目标麦克风后才开始守护
+        self.ok = True
+        self.target = None
+
+    def _is_mic(self, name):
+        return self.match in name and not name.endswith(".monitor")
+
+    def check(self):
+        for card in parse_cards(self.run("list", "cards") or ""):
+            if self.match not in card["name"]:
+                continue
+            profile = input_profile_to_restore(card)
+            if profile and self.run("set-card-profile", card["name"], profile) is not None:
+                self.log(f"声卡 {card['name']} 配置 {card['active']} -> {profile}")
+
+        sources = parse_sources(self.run("list", "sources", "short") or "")
+        mics = sorted(n for n in sources if self._is_mic(n))
+        if not mics:
+            self._set_ok(not self.armed, None)
+            return
+        self.armed = True
+        target = self.target if self.target in mics else mics[0]
+        outs = [o for o in parse_source_outputs(self.run("list", "source-outputs") or "")
+                if o["pid"] == self.pid]
+        ok = True
+        for o in outs:
+            if o["source"] == sources[target]:
+                continue
+            if self.run("move-source-output", str(o["index"]), target) is not None:
+                self.log(f"录音流切回 {target}")
+            else:
+                ok = False
+        self._set_ok(ok, target)
+
+    def _set_ok(self, ok, target):
+        if ok and (not self.ok or target != self.target) and target:
+            self.log(f"麦克风可用：{target}")
+        elif not ok and self.ok:
+            self.log("麦克风断开，等待重新连接")
+        self.ok, self.target = ok, target
+
+
 class Dictation:
     def __init__(self, ui_queue):
         self.ui = ui_queue
@@ -87,13 +213,40 @@ class Dictation:
         self.chunks = []        # 当前录音的音频块
         self.preroll = []       # 未录音时的环形缓冲
         self.level = 0.0        # 当前音量 0~1，给悬浮窗的波形用
+        self.mic = MicKeeper(MIC_MATCH, log=log) if shutil.which("pactl") else None
+        if self.mic is None:
+            log("没有 pactl，不守护麦克风连接")
+        self.stream = None
+        self._open_stream()
+        if self.mic:
+            threading.Thread(target=self._watch_mic, daemon=True).start()
+
+    @property
+    def mic_ok(self):
+        return self.mic is None or self.mic.ok
+
+    def _open_stream(self):
         self.stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
             blocksize=int(SAMPLE_RATE * 0.05), callback=self._on_audio)
         self.stream.start()
 
+    def _watch_mic(self):
+        while True:
+            try:
+                self.mic.check()
+                if not self.stream.active:  # 录音流本身出错停了，重新打开
+                    log("录音流已停止，重新打开")
+                    self.stream.close()
+                    self._open_stream()
+            except Exception as e:
+                log(f"检查麦克风出错：{e!r}")
+            time.sleep(MIC_CHECK_INTERVAL)
+
     def _on_audio(self, data, frames, t, status):
         block = data[:, 0].copy()
+        if not self.mic_ok:  # 麦克风不在时录到的是别的源（如扬声器回环），丢弃
+            block[:] = 0
         db = 20 * np.log10(np.sqrt((block ** 2).mean()) + 1e-9)
         self.level = float(np.clip((db + 50) / 35, 0, 1))
         with self.lock:
@@ -306,8 +459,9 @@ class Panel(QWidget):
 class Overlay:
     MARGIN = 24  # 给阴影留的透明边距
 
-    def __init__(self, ui_queue, level_fn):
+    def __init__(self, ui_queue, level_fn, mic_ok_fn=lambda: True):
         self.q = ui_queue
+        self.mic_ok_fn = mic_ok_fn
         self.app = QApplication.instance() or QApplication(sys.argv)
         self.win = QWidget(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
                            | Qt.WindowDoesNotAcceptFocus | Qt.X11BypassWindowManagerHint)
@@ -345,9 +499,10 @@ class Overlay:
 
     def _set_text(self, text):
         if not text:
+            hint = "正在聆听…" if self.mic_ok_fn() else "麦克风未连接，等待重新连接…"
             self.label.setStyleSheet("color: rgba(255,255,255,0.55);")
-            self.label.setText("正在聆听…")
-            self.label.setFixedWidth(self.fm.horizontalAdvance("正在聆听…") + 2)
+            self.label.setText(hint)
+            self.label.setFixedWidth(self.fm.horizontalAdvance(hint) + 2)
             return
         self.label.setStyleSheet("color: #f2f3f5;")
         # 超过 TEXT_MAX_LINES 行就从前面截掉，保留最新说的话
@@ -446,7 +601,7 @@ def main():
     ui_queue = queue.Queue()
     log("加载模型…")
     d = Dictation(ui_queue)
-    overlay = Overlay(ui_queue, lambda: d.level)
+    overlay = Overlay(ui_queue, lambda: d.level, lambda: d.mic_ok)
     d.rec(np.zeros(SAMPLE_RATE, np.float32))  # 预热
     hk = HotkeyListener(d)
     listener = keyboard.Listener(on_press=hk.on_press, on_release=hk.on_release)
