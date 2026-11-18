@@ -266,15 +266,17 @@ class Dictation:
                     del self.preroll[:-keep]
 
     def start(self):
-        with self.lock:
-            self.recording = True
-            self.chunks = list(self.preroll)
-            self.preroll = []
         # 每次录音一个独立会话，快速连按时前后两次互不干扰
         sess = SimpleNamespace(stop=threading.Event(), frozen_text="", frozen_len=0)
         sess.thread = threading.Thread(target=self._preview_loop, args=(sess,), daemon=True)
-        self.sess = sess
-        self.ui.put(("show", ""))
+        with self.lock:
+            if self.recording:  # 上一次没收尾就又开始：先结束它，否则它的预览线程会一直跑
+                self.sess.stop.set()
+            self.recording = True
+            self.chunks = list(self.preroll)
+            self.preroll = []
+            self.sess = sess
+            self.ui.put(("show", ""))
         sess.thread.start()
 
     def _take_audio(self):
@@ -296,8 +298,10 @@ class Dictation:
             if sess.stop.is_set():
                 return
             text = sess.frozen_text + self.rec(tail)
-            if not sess.stop.is_set():
-                self.ui.put(("show", text))
+            # 和 stop() 在同一把锁里判断，保证 "hide" 之后不会再冒出 "show" 把悬浮窗重新打开
+            with self.lock:
+                if not sess.stop.is_set():
+                    self.ui.put(("show", text))
 
     def stop(self, commit=True):
         with self.lock:
@@ -305,9 +309,9 @@ class Dictation:
                 return
             self.recording = False
             audio = np.concatenate(self.chunks) if self.chunks else np.zeros(0, np.float32)
-        sess = self.sess
-        sess.stop.set()
-        self.ui.put(("hide", None))
+            sess = self.sess
+            sess.stop.set()
+            self.ui.put(("hide", None))
         if commit:
             threading.Thread(target=self._finalize, args=(sess, audio), daemon=True).start()
 
